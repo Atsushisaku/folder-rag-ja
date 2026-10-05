@@ -1,0 +1,12 @@
+[server]
+# 職場PCで LAN 側に公開しないため localhost に固定する
+address = "localhost"
+port = 8501
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# 右上の Deploy ボタン等を隠す
+toolbarMode = "minimal"

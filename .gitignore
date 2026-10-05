@@ -1,0 +1,9 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 個人設定・実データ由来のものはコミットしない
+/config.toml
+/.rag_index/

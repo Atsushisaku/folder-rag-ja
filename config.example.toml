@@ -1,0 +1,16 @@
+# このファイルを config.toml にコピーして使う (config.toml は .gitignore 済み)
+
+# 起動時に開くフォルダ (UI からも変更できる)
+data_dir = "sample_data"
+
+[ollama]
+host = "http://127.0.0.1:11434"
+embed_model = "bge-m3"
+chat_model = "qwen3:4b-instruct"
+
+[search]
+top_k = 5
+chunk_size = 500
+chunk_overlap = 80
+# 検索スコアに占める BM25 (キーワード一致) の割合。残りは埋め込み検索 (意味の近さ)
+bm25_weight = 0.3
