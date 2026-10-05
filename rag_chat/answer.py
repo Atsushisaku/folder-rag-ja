@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from pathlib import Path
 from collections.abc import Iterator
 
 from .config import Config
@@ -22,7 +23,7 @@ SYSTEM_PROMPT = """あなたは社内マニュアルの案内係です。
 def build_messages(question: str, hits: list[Hit]) -> list[dict]:
     blocks = []
     for i, h in enumerate(hits, start=1):
-        where = f"{h.path} {h.location}".strip()
+        where = f"{Path(h.folder).name}/{h.path} {h.location}".strip()
         blocks.append(f"[{i}] ({where})\n{h.text}")
     user = "資料:\n\n" + "\n\n".join(blocks) + f"\n\n質問: {question}"
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]

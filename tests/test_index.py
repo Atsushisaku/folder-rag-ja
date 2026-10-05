@@ -74,3 +74,31 @@ def test_delete_closes_shared_connection(env: Path):
     idx.update()
     delete_index(env)  # 開いたままの接続を閉じてから消す (Windows でもロックで失敗しない)
     assert not index_mod.index_path_for(env).exists()
+
+
+class TopicOllama:
+    """「経費」を含む文と質問を同じ向きに埋め込む簡易版。"""
+
+    def embed(self, model, texts):
+        return [[1.0, 0.0] if "経費" in t else [0.0, 1.0] for t in texts]
+
+
+def test_multi_index_searches_across_folders(env: Path, tmp_path: Path):
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "keihi.md").write_text("# 経費\n経費は20日締め", encoding="utf-8")
+    a, b = make_index(env), make_index(other)
+    a.ollama = b.ollama = TopicOllama()
+    a.update()
+    b.update()
+
+    multi = index_mod.MultiIndex([a, b], Config())
+    multi.ollama = TopicOllama()
+    hits = multi.search("経費の締め日", top_k=2)
+    assert hits[0].folder == str(other) and hits[0].path == "keihi.md"
+    assert {h.folder for h in multi.search("本文", top_k=4)} == {str(env), str(other)}
+
+    # 片方の索引が変わったら読み直す
+    (env / "doc0.md").write_text("# 経費の補足\n経費の申請", encoding="utf-8")
+    a.update()
+    assert any(h.folder == str(env) for h in multi.search("経費", top_k=2))

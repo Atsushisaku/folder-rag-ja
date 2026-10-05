@@ -12,7 +12,7 @@ import time
 
 from .answer import answer_stream
 from .config import load_config, resolve_dir
-from .index import FolderIndex
+from .index import FolderIndex, MultiIndex
 
 
 def main() -> int:
@@ -43,7 +43,7 @@ def main() -> int:
         return 1 if r.errors else 0
 
     t = time.perf_counter()
-    hits = idx.search(args.question)
+    hits = MultiIndex([idx], cfg).search(args.question)
     print(f"--- 検索結果 ({time.perf_counter() - t:.2f}s)")
     for i, h in enumerate(hits, start=1):
         print(f"[{i}] {h.path} {h.location}  score={h.score:.4f}")

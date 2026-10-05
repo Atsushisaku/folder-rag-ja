@@ -27,6 +27,7 @@ Progress = Callable[[int, int, str], None]
 
 @dataclass
 class Hit:
+    folder: str  # 索引のフォルダ (絶対パス)
     path: str  # フォルダからの相対パス
     location: str
     text: str
@@ -130,9 +131,7 @@ class FolderIndex:
             """
         )
         self._reset_if_settings_changed()
-        self._bm25: BM25 | None = None
-        self._rows: list[tuple[str, str, str]] = []
-        self._mat: np.ndarray | None = None
+        self.version = 0  # 索引が変わるたびに増やす (検索側のキャッシュの破棄に使う)
 
     # ---------- 索引の作成・更新 ----------
 
@@ -156,7 +155,7 @@ class FolderIndex:
         ファイルは 1 つ終わるごとに確定 (commit) する。progress から例外を投げれば途中で止められ、
         それまでに終えたファイルは索引に残り、次回の update は残りだけを処理する。
         """
-        self._bm25 = None  # 途中で止まっても、次の検索では索引を読み直す
+        self.version += 1  # 途中で止まっても、次の検索では索引を読み直す
         files = scan_files(self.folder)
         known = {p: (m, s) for p, m, s in self.db.execute("SELECT path, mtime, size FROM files")}
         current = {}
@@ -202,7 +201,7 @@ class FolderIndex:
             else:
                 added += 1
         self.db.commit()
-        self._bm25 = None  # 次の検索で読み直す
+        self.version += 1
 
         return UpdateResult(
             added=added,
@@ -235,13 +234,42 @@ class FolderIndex:
     def file_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
-    # ---------- 検索 ----------
-
-    def _load(self) -> None:
+    def load_chunks(self) -> tuple[list[tuple[str, str, str]], np.ndarray | None]:
+        """検索用に全チャンクを読む: [(相対パス, 位置, 本文)] と、埋め込みの行列。"""
         rows = self.db.execute("SELECT path, location, text, emb FROM chunks ORDER BY id").fetchall()
-        self._rows = [(p, loc, t) for p, loc, t, _ in rows]
-        self._mat = np.vstack([np.frombuffer(e, dtype=np.float32) for *_, e in rows]) if rows else None
-        self._bm25 = BM25([_with_header(p, loc, t) for p, loc, t in self._rows])
+        mat = np.vstack([np.frombuffer(e, dtype=np.float32) for *_, e in rows]) if rows else None
+        return [(p, loc, t) for p, loc, t, _ in rows], mat
+
+
+class MultiIndex:
+    """複数フォルダの索引をまとめて 1 つの検索対象として扱う。
+
+    スコアの正規化はフォルダごとではなく全体で行う (フォルダ間で点数を比べられるようにするため)。
+    """
+
+    def __init__(self, indexes: list[FolderIndex], cfg: Config):
+        self.indexes = indexes
+        self.cfg = cfg
+        self.ollama = Ollama(cfg.ollama_host)
+        self._key: tuple | None = None
+        self._rows: list[tuple[str, str, str, str]] = []  # (フォルダ, 相対パス, 位置, 本文)
+        self._mat: np.ndarray | None = None
+        self._bm25: BM25 | None = None
+
+    def _ensure_loaded(self) -> None:
+        key = tuple((str(i.folder), i.version) for i in self.indexes)
+        if key == self._key:
+            return
+        rows, mats = [], []
+        for idx in self.indexes:
+            r, m = idx.load_chunks()
+            rows += [(str(idx.folder), *row) for row in r]
+            if m is not None:
+                mats.append(m)
+        self._rows = rows
+        self._mat = np.vstack(mats) if mats else None
+        self._bm25 = BM25([_with_header(p, loc, t) for _, p, loc, t in rows])
+        self._key = key
 
     def search(self, query: str, top_k: int | None = None) -> list[Hit]:
         """埋め込み検索と BM25 のスコアを正規化して重み付きで足し合わせる。
@@ -251,8 +279,7 @@ class FolderIndex:
         スコアの差 (確信の強さ) を残すため、ここではスコアの加重和にしている。
         """
         top_k = top_k or self.cfg.top_k
-        if self._bm25 is None:
-            self._load()
+        self._ensure_loaded()
         if not self._rows:
             return []
 

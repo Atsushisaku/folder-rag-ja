@@ -12,7 +12,7 @@ import streamlit as st
 
 from rag_chat.answer import answer_stream, cited_sources
 from rag_chat.config import load_config, load_state, resolve_dir, save_state
-from rag_chat.index import FolderIndex, delete_index, list_indexed_folders, open_index
+from rag_chat.index import FolderIndex, MultiIndex, delete_index, list_indexed_folders, open_index
 from rag_chat.ollama_client import Ollama, OllamaError, has_model
 
 st.set_page_config(page_title="ローカル RAG チャット", page_icon="📚", layout="wide")
@@ -44,41 +44,44 @@ def check_ollama() -> list[str]:
 
 
 # ---------- 状態 ----------
-# ss["folder"]     : 選択中のフォルダ (絶対パスの文字列)。None なら未選択
-# ss["checked"]    : このセッションで差分更新を済ませた (または中止した) フォルダ
-# ss["notice"]     : フォルダごとの直近の更新結果 (メッセージ, 一覧の下にも出すか)
-# ss["added"]      : このセッションで追加したフォルダ。索引がまだ無くても選べるのはこれだけ
-#                    (別のタブで索引を削除したフォルダを、こちらのタブが勝手に作り直さないため)
+# 参照フォルダ = .rag_index/ に索引があるフォルダ。チェックを外したものは state.json の "excluded" に残す
+# ss["checked"] : このセッションで差分更新を済ませた (または中止した) フォルダ
+# ss["notice"]  : フォルダごとの直近の更新結果 (メッセージ, 一覧の下にも出すか = 中止・エラー)
 
 ss.setdefault("checked", set())
-ss.setdefault("added", set())
 ss.setdefault("notice", {})
 ss.setdefault("messages", [])
-if "folder" not in ss:
-    state = load_state()
-    if "folder" in state:
-        ss["folder"] = state["folder"]
-    else:  # 初回起動だけ config の data_dir (既定はサンプル) を開く
-        d = resolve_dir(cfg.data_dir)
-        ss["folder"] = str(d) if d.is_dir() else None
-        if ss["folder"]:
-            ss["added"].add(ss["folder"])
 
-
-def select_folder(folder: str | None) -> None:
-    if folder != ss.get("folder"):
-        ss["messages"] = []
-    ss["folder"] = folder
-    save_state(folder=folder)
-
-
-def add_folder(folder: str) -> None:
-    ss["added"].add(folder)
-    select_folder(folder)
+if not load_state().get("initialized"):
+    # 初回起動だけ config の data_dir (既定はサンプル) を参照フォルダに入れておく
+    d = resolve_dir(cfg.data_dir)
+    if d.is_dir() and not list_indexed_folders():
+        open_index(d, cfg)
+    save_state(initialized=True)
 
 
 def get_index(folder: str) -> FolderIndex:
     return open_index(Path(folder), cfg)
+
+
+def excluded() -> set[str]:
+    return set(load_state().get("excluded", []))
+
+
+def set_enabled(folder: str) -> None:
+    ex = excluded()
+    if ss[f"use::{folder}"]:
+        ex.discard(folder)
+    else:
+        ex.add(folder)
+    save_state(excluded=sorted(ex))
+
+
+def add_folder(folder: str) -> None:
+    get_index(folder)  # 索引ファイルを作ると一覧に載る。中身は次の差分更新で読み込む
+    ss["checked"].discard(folder)
+    ss[f"use::{folder}"] = True
+    save_state(excluded=sorted(excluded() - {folder}))
 
 
 def remove_folder(folder: str) -> None:
@@ -88,10 +91,29 @@ def remove_folder(folder: str) -> None:
         ss["notice"][folder] = ("削除できませんでした。索引の更新中なら、終わるか中止してから再度お試しください。", True)
         return
     ss["checked"].discard(folder)
-    ss["added"].discard(folder)
     ss["notice"].pop(folder, None)
-    rest = [f.folder for f in list_indexed_folders()]
-    select_folder(rest[0] if rest else None)
+    ss.pop(f"use::{folder}", None)
+    save_state(excluded=sorted(excluded() - {folder}))
+
+
+def request_update() -> None:
+    ss["force_update"] = True
+
+
+def request_delete(folder: str) -> None:
+    ss["delete_target"] = folder
+
+
+@st.dialog("索引を削除")
+def confirm_delete(folder: str, label: str) -> None:
+    st.markdown(f"**{label}** の索引を削除します。元のファイルは削除されません。")
+    st.caption(folder)
+    c1, c2 = st.columns(2)
+    if c1.button("削除する", type="primary", use_container_width=True):
+        remove_folder(folder)
+        st.rerun()
+    if c2.button("キャンセル", use_container_width=True):
+        st.rerun()
 
 
 def request_cancel() -> None:
@@ -100,46 +122,46 @@ def request_cancel() -> None:
     ss["cancelled"] = ss.get("updating")
 
 
-def run_update(folder: str) -> None:
-    idx = get_index(folder)
-    slot = st.empty()  # 終わったら進捗バーと中止ボタンをまとめて消すための置き場
+def run_updates(targets: list[str], labels: dict[str, str]) -> list[str]:
+    """targets の差分更新を順に行い、変更があったフォルダの結果を返す。
+
+    進捗バーと中止ボタンは終わったらまとめて消す。
+    """
+    changes = []
+    slot = st.empty()
     box = slot.container()
     bar = box.progress(0.0, text="索引を確認中…")
     box.button("中止", key="cancel_update", on_click=request_cancel, use_container_width=True)
-    ss["updating"] = folder
-    t = time.perf_counter()
-    r = idx.update(lambda i, n, name: bar.progress(min(i / n, 1.0), text=f"[{i}/{n}] {name}"))
+    for k, folder in enumerate(targets):
+        ss["updating"] = targets[k:]  # 中止されたら、残りのフォルダも自動では再開しない
+        name = labels.get(folder, folder)
+        t = time.perf_counter()
+        r = get_index(folder).update(
+            lambda i, n, f: bar.progress(min(i / n, 1.0), text=f"{name}: [{i}/{n}] {f}"))
+        ss["checked"].add(folder)
+        changed = r.added + r.updated + r.removed
+        msg = (f"追加 {r.added} / 更新 {r.updated} / 削除 {r.removed} ({time.perf_counter() - t:.1f}s)"
+               if changed else "変更はありません")
+        if r.errors:
+            msg = f"{name}: {msg}  \n" + "  \n".join(f"⚠ {e}" for e in r.errors)
+        ss["notice"][folder] = (msg, bool(r.errors))
+        if changed:
+            changes.append(f"{name}: {msg}")
     ss["updating"] = None
     slot.empty()
-    ss["checked"].add(folder)
-    changed = r.added + r.updated + r.removed
-    msg = (f"追加 {r.added} / 更新 {r.updated} / 削除 {r.removed} ({time.perf_counter() - t:.1f}s)"
-           if changed else "変更はありません")
-    if r.errors:
-        msg += "  \n" + "  \n".join(f"⚠ {e}" for e in r.errors)
-    ss["notice"][folder] = (msg, bool(r.errors))
+    return changes
 
 
 # 中止ボタンで打ち切られた直後の再実行
 if cancelled := ss.pop("cancelled", None):
     ss["updating"] = None
-    ss["checked"].add(cancelled)  # 自動で再開しない
-    ss["notice"][cancelled] = ("中止しました。ここまでに読み込んだファイルは検索できます。続きは「索引編集」の「索引を更新」で再開します。", True)
+    ss["checked"].update(cancelled)
+    ss["notice"][cancelled[0]] = (
+        "中止しました。ここまでに読み込んだファイルは検索できます。続きは「更新」で再開します。", True)
 elif ss.get("updating"):
-    # 中止ボタン以外 (フォルダの切り替え等) で打ち切られた場合。次に開いたときに続きから更新する
-    ss["checked"].discard(ss["updating"])
+    # 中止ボタン以外 (チェックの付け外し等) で打ち切られた場合。次の実行で続きから更新する
+    ss["checked"].difference_update(ss["updating"])
     ss["updating"] = None
-
-
-# ---------- サイドバー: 参照フォルダ ----------
-
-def request_update(folder: str) -> None:
-    ss["force_update"] = folder
-
-
-def request_delete(folder: str) -> None:
-    remove_folder(folder)
-    ss["confirm_delete"] = False  # 次に開いたときにチェックが残らないように
 
 
 def folder_labels(paths: list[str]) -> dict[str, str]:
@@ -151,76 +173,75 @@ def folder_labels(paths: list[str]) -> dict[str, str]:
     }
 
 
+# ---------- サイドバー: 参照フォルダ ----------
+
 with st.sidebar:
     st.header("参照フォルダ")
+    st.caption("チェックしたフォルダをまとめて検索します")
 
     folders = {f.folder: f for f in list_indexed_folders()}
-    paths = list(folders)
-    current = ss["folder"]
-    if current and current not in folders:
-        if current in ss["added"] and Path(current).is_dir():
-            paths.append(current)  # 追加したばかりで索引がまだ無いもの
-        else:  # 別のタブで索引が削除された
-            select_folder(paths[0] if paths else None)
-            current = ss["folder"]
+    labels = folder_labels(list(folders))
+    ex = excluded()
+    for p, info in folders.items():
+        ss.setdefault(f"use::{p}", p not in ex)
+        status = f"{info.files} ファイル" + ("" if info.exists else " · ⚠ フォルダが見つかりません")
+        c_check, c_del = st.columns([0.85, 0.15], vertical_alignment="center")
+        c_check.checkbox(f"{labels[p]} :gray[{status}]", key=f"use::{p}", on_change=set_enabled, args=(p,),
+                         help=p)
+        c_del.button("✕", key=f"del::{p}", on_click=request_delete, args=(p,), type="tertiary",
+                     help="索引を削除（元のファイルは消えません）")
+    if not folders:
+        st.info("「追加」で読み込むフォルダを追加してください")
+    enabled = [p for p in folders if ss.get(f"use::{p}")]
+    if (target := ss.pop("delete_target", None)) in folders:
+        confirm_delete(target, labels[target])
 
-    if paths:
-        labels = folder_labels(paths)
-
-        def caption(p: str) -> str:
-            info = folders.get(p)
-            if info is None:
-                return "未読み込み"
-            return f"{info.files} ファイル" + ("" if info.exists else " · ⚠ フォルダが見つかりません")
-
-        chosen = st.radio(
-            "参照フォルダ", paths, index=paths.index(current) if current in paths else 0,
-            format_func=labels.get, captions=[caption(p) for p in paths], label_visibility="collapsed",
-        )
-        if chosen != current:
-            select_folder(chosen)
-            st.rerun()
-    else:
-        st.info("「参照…」で読み込むフォルダを追加してください")
-
-    folder = ss["folder"]
     problems = check_ollama()
-    idx = get_index(folder) if folder and Path(folder).is_dir() and not problems else None
 
     c1, c2 = st.columns(2)
-    if c1.button("参照…", use_container_width=True, help="フォルダを選んで追加します"):
+    if c1.button("追加", use_container_width=True, help="読み込むフォルダを選んで追加します"):
         picked = pick_folder()
         if picked:
             add_folder(str(Path(picked).resolve()))
             st.rerun()
-    with c2.popover("索引編集", use_container_width=True, disabled=folder is None):
-        if folder:
-            st.markdown(f"**{Path(folder).name or folder}**")
-            st.caption(folder)
-            if idx is not None:
-                st.caption(f"{idx.file_count()} ファイル / {idx.chunk_count()} チャンク")
-            if notice := ss["notice"].get(folder):
-                st.caption(f"前回: {notice[0]}")
-            st.button("索引を更新", on_click=request_update, args=(folder,), disabled=idx is None,
-                      use_container_width=True, help="追加・変更・削除されたファイルだけ読み直します")
-            st.divider()
-            confirm = st.checkbox("この索引を削除する（元のファイルは消えません）", key="confirm_delete")
-            st.button("削除", type="primary", on_click=request_delete, args=(folder,), disabled=not confirm,
-                      use_container_width=True)
+    c2.button("更新", on_click=request_update, use_container_width=True,
+              disabled=bool(problems) or not any(folders[p].exists for p in enabled),
+              help="チェックしたフォルダの追加・変更・削除されたファイルだけ読み直します")
 
     for msg in problems:
         st.warning(msg)
-    if folder and not Path(folder).is_dir():
-        st.warning("フォルダが見つかりません（移動・削除された可能性があります）。不要なら「索引編集」から削除してください。")
+    missing = [labels[p] for p in enabled if not folders[p].exists]
+    if missing:
+        st.warning(f"フォルダが見つかりません: {'、'.join(missing)}。索引は残っているので検索には使います"
+                   "（移動・削除した場合は ✕ で索引を削除してください）。")
 
-    # 「索引を更新」が押されたとき、またはこのセッションで初めて開いたときに差分更新する (1 回の実行で 1 回だけ)
-    if idx is not None and (ss.pop("force_update", None) == folder or folder not in ss["checked"]):
-        run_update(folder)
-    if folder and (notice := ss["notice"].get(folder)) and notice[1]:
-        st.caption(notice[0])  # 中止・エラーなど、気づいてほしいものだけ一覧の下にも出す
+    # 「更新」が押されたとき、またはこのセッションでまだ確認していないフォルダがあるとき、チェック済みを差分更新する
+    if not problems:
+        forced = ss.pop("force_update", False)
+        targets = [p for p in enabled if folders[p].exists and (forced or p not in ss["checked"])]
+        if targets:
+            changes = run_updates(targets, labels)
+            if forced or changes:
+                ss["toast"] = "  \n".join(changes) if changes else "変更はありません"
+            st.rerun()  # 一覧のファイル数を最新にする
+    if msg := ss.pop("toast", None):
+        st.toast(msg)
+    for p in folders:
+        if (notice := ss["notice"].get(p)) and notice[1]:
+            st.caption(notice[0])  # 中止・エラーなど、気づいてほしいものだけ一覧の下にも出す
 
     st.divider()
     st.caption(f"生成: `{cfg.chat_model}` / 埋め込み: `{cfg.embed_model}`")
+
+search_index = None
+if enabled and not problems:
+    # 対象が変わらない限り使い回す (読み込んだチャンクと BM25 を毎回作り直さないため)。
+    # 索引を削除して作り直すと FolderIndex も別物になるので、オブジェクトの同一性で判定する
+    indexes = [get_index(p) for p in enabled]
+    if ss.get("search_key") != [id(i) for i in indexes]:
+        ss["search_index"] = MultiIndex(indexes, cfg)
+        ss["search_key"] = [id(i) for i in indexes]
+    search_index = ss["search_index"]
 
 
 # ---------- メイン: チャット ----------
@@ -253,8 +274,9 @@ st.markdown(
 )
 
 st.title("📚 ローカル RAG チャット")
-if folder:
-    st.caption(f"対象: {folder}")
+if folders:
+    st.caption("検索対象: " + ("、".join(labels[p] for p in enabled) if enabled
+                              else "なし（参照フォルダにチェックを入れてください）"))
 
 STOPPED_NOTE = "（生成を停止しました）"
 
@@ -267,7 +289,8 @@ def show_references(text: str, hits: list[dict]) -> None:
     """回答が [n] で引用した資料だけを 1 行で示す (引用が無ければ何も出さない)。"""
     refs = cited_sources(text, hits)
     if refs:
-        st.caption("参照: " + " / ".join(f"[{n}] {h['path']} {h['location']}".strip() for n, h in refs))
+        st.caption("参照: " + " / ".join(
+            f"[{n}] {Path(h['folder']).name}/{h['path']} {h['location']}".strip() for n, h in refs))
 
 
 # 前回の実行が生成の途中で打ち切られた (停止ボタン、生成中に次の質問を送った等)。
@@ -283,8 +306,8 @@ for m in ss["messages"]:
         if m.get("hits"):
             show_references(m["content"], m["hits"])
 
-question = st.chat_input("マニュアルについて質問してください", disabled=idx is None)
-if question and idx is not None:
+question = st.chat_input("マニュアルについて質問してください", disabled=search_index is None)
+if question and search_index is not None:
     ss["messages"].append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -295,7 +318,7 @@ if question and idx is not None:
         streaming = ss["streaming"] = {"text": "", "hits": []}
         try:
             waiting(status_ph, "資料を検索中")
-            hits = idx.search(question)
+            hits = search_index.search(question)
             streaming["hits"] = [h.__dict__ for h in hits]
             waiting(status_ph, "回答を作成中")
             # closing: 打ち切られたときも Ollama への接続を確実に閉じ、生成を止める
