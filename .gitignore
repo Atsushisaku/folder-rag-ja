@@ -7,3 +7,6 @@ __pycache__/
 # 個人設定・実データ由来のものはコミットしない
 /config.toml
 /.rag_index/
+
+# ローカルの構想メモ (職場の事情を含むため公開しない)
+/rag-chat-plan.md
