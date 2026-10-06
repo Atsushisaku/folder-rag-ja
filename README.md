@@ -9,7 +9,7 @@
 - 索引はプロジェクト内の `.rag_index/` に保存し、読み込むフォルダには何も書き込まない
 - 2 回目以降は、追加・変更・削除されたファイルだけ索引を作り直す
 
-仕組みの解説は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
+仕組みの解説は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、精度・速度を上げる方法は [docs/IMPROVEMENT.md](docs/IMPROVEMENT.md) を参照してください。
 
 ## 必要なもの
 
