@@ -9,6 +9,8 @@
 - 索引はプロジェクト内の `.rag_index/` に保存し、読み込むフォルダには何も書き込まない
 - 2 回目以降は、追加・変更・削除されたファイルだけ索引を作り直す
 
+仕組みの解説は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
+
 ## 必要なもの
 
 - [uv](https://docs.astral.sh/uv/)（Python 本体も uv が用意するので、PC にインストール済みの Python のバージョンは問わない）
